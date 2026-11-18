@@ -3076,69 +3076,6 @@
                 `<span class="text-emerald-400 font-bold">방(${code})에 입장 신호를 보냈습니다!</span> 방장과 매칭되면 즉시 플레이볼됩니다.`;
         }
 
-            renderQRCode(code);
-            btn.disabled = false;
-            btn.textContent = '📷 QR 방 다시 만들기';
-            document.getElementById('online-status-text').innerHTML =
-                `방 코드 <b class="text-amber-400 text-sm">${code}</b> 생성 완료! 친구가 QR코드를 스캔하거나 방 코드를 입력하면 즉시 경기가 시작됩니다.`;
-        }
-
-        async function joinOnlineRoom(inputCode) {
-            const code = (inputCode || '').trim().toUpperCase();
-            if (code.length < 4) {
-                document.getElementById('online-status-text').innerHTML =
-                    `<span class="text-amber-300 font-bold">6자리 방 코드를 입력해 주세요.</span>`;
-                return;
-            }
-
-            const joinBtn = document.getElementById('join-room-btn');
-            joinBtn.disabled = true;
-            joinBtn.textContent = '연결 중...';
-
-            const mode = await initNetworkBackend();
-            currentRoomCode = code;
-            myRole = 'guest';
-            window.kboOnlineActive = true;
-
-            const st = window.kboGameAPI.getState();
-            const selectedP = KBO_TEAMS[st.selectedTeamIndex].pitchers[st.selectedPitcherIndex];
-            const joinPacket = {
-                type: 'JOIN_REQUEST',
-                roomCode: code,
-                guestTeamIdx: st.selectedTeamIndex,
-                guestLineup: JSON.stringify(st.userLineup),
-                guestPitcher: JSON.stringify(selectedP)
-            };
-
-            if (mode === 'cloud') {
-                const snap = await getDoc(getRoomDocRef(code));
-                if (!snap.exists()) {
-                    joinBtn.disabled = false;
-                    joinBtn.textContent = '입장 (홈팀)';
-                    document.getElementById('online-status-text').innerHTML =
-                        `<span class="text-rose-400 font-bold">방 코드(${code})를 찾을 수 없습니다.</span> 코드를 다시 확인해 주세요.`;
-                    return;
-                }
-                await updateDoc(getRoomDocRef(code), {
-                    status: 'playing',
-                    guestUid: currentUser.uid,
-                    guestTeamIdx: st.selectedTeamIndex,
-                    guestLineup: JSON.stringify(st.userLineup),
-                    guestPitcher: JSON.stringify(selectedP),
-                    updatedAt: Date.now()
-                });
-                subscribeCloudRoom(code);
-            } else {
-                broadcastPacket(joinPacket);
-                await connectPeerGuest(code, joinPacket);
-            }
-
-            joinBtn.disabled = false;
-            joinBtn.textContent = '입장 (홈팀)';
-            document.getElementById('online-status-text').innerHTML =
-                `<span class="text-emerald-400 font-bold">방(${code}) 연결 완료 대기 중...</span> 방장과 동기화되면 바로 시작됩니다!`;
-        }
-
         async function pushRoomEvent(type, payloadObj) {
             if (!window.kboOnlineActive || !currentRoomCode) return;
             const evtId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
