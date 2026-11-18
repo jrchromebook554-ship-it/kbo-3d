@@ -8,6 +8,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&family=Noto+Sans+KR:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
         body {
@@ -89,6 +90,9 @@
                     <p id="online-status-text" class="text-xs text-slate-300">
                         먼저 아래에서 내 구단·타순·투수를 고른 뒤 <b>[QR 방 만들기]</b>를 누르거나, 친구의 방 코드를 입력하세요!
                     </p>
+                    <div id="local-url-warning" class="hidden text-[11px] text-amber-300 bg-amber-950/60 border border-amber-500/40 px-2.5 py-1.5 rounded-lg">
+                        💡 현재 로컬/미리보기 주소입니다. 같은 PC 새 탭에서 테스트하거나, 웹에 배포된 URL에서 스마트폰 QR로 접속하세요!
+                    </div>
                     <div class="flex flex-wrap items-center gap-2 pt-1">
                         <button id="create-room-btn" class="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs sm:text-sm cursor-pointer">
                             📷 QR 방 만들기 (방장/원정)
@@ -967,7 +971,17 @@
             camera.position.set(0.18, 1.52, 2.25);
             camera.lookAt(0, 0.96, -18.44);
 
-            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+            try {
+                renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+            } catch (e1) {
+                try {
+                    renderer = new THREE.WebGLRenderer({ antialias: false, failIfMajorPerformanceCaveat: false });
+                } catch (e2) {
+                    console.warn('WebGL unavailable, falling back to 2D stadium renderer:', e2);
+                    renderer = null;
+                    return;
+                }
+            }
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
             renderer.shadowMap.enabled = true;
@@ -2497,6 +2511,31 @@
             hudCanvas.height = window.innerHeight;
             hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
 
+            // WebGL 컨텍스트가 없는 환경일 경우 2D 구장 백업 렌더링
+            if (!renderer) {
+                const w = hudCanvas.width;
+                const h = hudCanvas.height;
+                const grad = hudCtx.createLinearGradient(0, 0, 0, h);
+                grad.addColorStop(0, '#0b172a');
+                grad.addColorStop(0.45, '#15803d');
+                grad.addColorStop(1, '#14532d');
+                hudCtx.fillStyle = grad;
+                hudCtx.fillRect(0, 0, w, h);
+
+                hudCtx.fillStyle = '#9a5b25';
+                hudCtx.beginPath();
+                hudCtx.ellipse(w * 0.5, h * 0.72, w * 0.28, h * 0.16, 0, 0, Math.PI * 2);
+                hudCtx.fill();
+
+                if (currentPitch.active) {
+                    const pScreen = project3DToScreen(currentPitch.x, currentPitch.y, currentPitch.z);
+                    hudCtx.fillStyle = '#ffffff';
+                    hudCtx.beginPath();
+                    hudCtx.arc(pScreen.x, pScreen.y, 7 + currentPitch.progress * 6, 0, Math.PI * 2);
+                    hudCtx.fill();
+                }
+            }
+
             if (!matchStarted || spotlightAnim.active) return;
 
             if (phase === GAME_PHASE.READY || phase === GAME_PHASE.WINDUP || phase === GAME_PHASE.PITCHING) {
@@ -2757,12 +2796,56 @@
         let currentRoomCode = null;
         let roomUnsubscribe = null;
         let lastProcessedEventId = '';
-        let bc = null; // 동일 브라우저/창 간 즉시 통신 폴백
+        let bc = null;
+        let peer = null;
+        let activeConn = null;
+        let ntfyEventSource = null;
         const localRoomStore = {};
+        const myClientId = Math.random().toString(36).slice(2, 10);
 
         window.kboOnlineActive = false;
 
+        function startNtfyRoomStream(code) {
+            if (ntfyEventSource) {
+                try { ntfyEventSource.close(); } catch (e) {}
+                ntfyEventSource = null;
+            }
+            const topic = `kbo_legend_3d_room_${code.toLowerCase()}`;
+            try {
+                ntfyEventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+                ntfyEventSource.onmessage = (ev) => {
+                    try {
+                        const wrapper = JSON.parse(ev.data);
+                        if (!wrapper || !wrapper.message) return;
+                        const packet = JSON.parse(wrapper.message);
+                        if (packet && packet.clientId !== myClientId) {
+                            handleChannelMessage(packet);
+                        }
+                    } catch (e) {}
+                };
+            } catch (e) {
+                console.warn('SSE stream unavailable:', e);
+            }
+        }
+
+        async function publishNtfyPacket(code, packet) {
+            const topic = `kbo_legend_3d_room_${code.toLowerCase()}`;
+            const payload = JSON.stringify({ ...packet, clientId: myClientId });
+            try {
+                await fetch(`https://ntfy.sh/${topic}`, {
+                    method: 'POST',
+                    body: payload
+                });
+            } catch (e) {}
+        }
+
         async function initNetworkBackend() {
+            if (!bc && typeof BroadcastChannel !== 'undefined') {
+                bc = new BroadcastChannel('kbo_legend_3d_online');
+                bc.onmessage = (ev) => {
+                    if (ev.data && ev.data.clientId !== myClientId) handleChannelMessage(ev.data);
+                };
+            }
             if (useCloud && db && currentUser) return 'cloud';
             try {
                 if (typeof __firebase_config !== 'undefined' && __firebase_config) {
@@ -2783,13 +2866,22 @@
                     }
                 }
             } catch (err) {
-                console.warn('Cloud fallback to local channel:', err);
+                console.warn('Cloud fallback to relay/local:', err);
             }
-            if (!bc && typeof BroadcastChannel !== 'undefined') {
-                bc = new BroadcastChannel('kbo_legend_3d_online');
-                bc.onmessage = (ev) => handleLocalChannelMessage(ev.data);
+            return 'relay';
+        }
+
+        function broadcastPacket(packet) {
+            const enriched = { ...packet, clientId: myClientId };
+            if (activeConn && activeConn.open) {
+                try { activeConn.send(enriched); } catch (e) {}
             }
-            return 'local';
+            if (bc) {
+                try { bc.postMessage(enriched); } catch (e) {}
+            }
+            if (packet && packet.roomCode) {
+                publishNtfyPacket(packet.roomCode, enriched);
+            }
         }
 
         function generateRoomCode() {
@@ -2801,16 +2893,21 @@
 
         function renderQRCode(roomCode) {
             let inviteUrl = '';
+            const warnEl = document.getElementById('local-url-warning');
             try {
                 const url = new URL(window.location.href);
-                if (url.protocol.startsWith('http')) {
+                if (url.protocol.startsWith('http') && !url.hostname.includes('localhost') && !url.hostname.includes('127.0.0.1') && url.hostname !== '') {
                     url.searchParams.set('room', roomCode);
                     inviteUrl = url.toString();
+                    warnEl.classList.add('hidden');
                 } else {
-                    inviteUrl = `KBO3D-ROOM:${roomCode}`;
+                    url.searchParams.set('room', roomCode);
+                    inviteUrl = url.toString();
+                    warnEl.classList.remove('hidden');
                 }
             } catch (e) {
-                inviteUrl = `KBO3D-ROOM:${roomCode}`;
+                inviteUrl = roomCode;
+                warnEl.classList.remove('hidden');
             }
 
             const qrWrapper = document.getElementById('qr-box-wrapper');
@@ -2833,13 +2930,13 @@
 
             document.getElementById('copy-invite-btn').onclick = () => {
                 const tempInput = document.createElement('input');
-                tempInput.value = inviteUrl.startsWith('http') ? inviteUrl : roomCode;
+                tempInput.value = inviteUrl;
                 document.body.appendChild(tempInput);
                 tempInput.select();
                 document.execCommand('copy');
                 document.body.removeChild(tempInput);
                 document.getElementById('online-status-text').innerHTML =
-                    `<span class="text-amber-300 font-bold">복사 완료!</span> 방 코드 <b>${roomCode}</b> 또는 초대 링크를 친구에게 공유하세요.`;
+                    `<span class="text-amber-300 font-bold">복사 완료!</span> 방 코드 <b>${roomCode}</b> 또는 초대 링크를 친구에게 보내세요.`;
             };
         }
 
@@ -2847,7 +2944,7 @@
             return doc(db, 'artifacts', appId, 'public', 'data', 'kbo_rooms', code);
         }
 
-        function handleLocalChannelMessage(msg) {
+        function handleChannelMessage(msg) {
             if (!msg || msg.roomCode !== currentRoomCode) return;
             if (msg.type === 'JOIN_REQUEST' && myRole === 'host') {
                 const roomData = localRoomStore[currentRoomCode];
@@ -2856,7 +2953,7 @@
                 roomData.guestTeamIdx = msg.guestTeamIdx;
                 roomData.guestLineup = msg.guestLineup;
                 roomData.guestPitcher = msg.guestPitcher;
-                bc.postMessage({ type: 'MATCH_START', roomCode: currentRoomCode, roomData });
+                broadcastPacket({ type: 'MATCH_START', roomCode: currentRoomCode, roomData });
                 startOnlineMatchFromRoom(roomData);
             } else if (msg.type === 'MATCH_START' && myRole === 'guest') {
                 startOnlineMatchFromRoom(msg.roomData);
@@ -2868,7 +2965,7 @@
         async function createOnlineRoom() {
             const btn = document.getElementById('create-room-btn');
             btn.disabled = true;
-            btn.textContent = '생성 중...';
+            btn.textContent = '방 생성 중...';
 
             const mode = await initNetworkBackend();
             const code = generateRoomCode();
@@ -2899,18 +2996,18 @@
                 updatedAt: Date.now()
             };
 
+            localRoomStore[code] = roomPayload;
+            startNtfyRoomStream(code);
             if (mode === 'cloud') {
                 await setDoc(getRoomDocRef(code), roomPayload);
                 subscribeCloudRoom(code);
-            } else {
-                localRoomStore[code] = roomPayload;
             }
 
             renderQRCode(code);
             btn.disabled = false;
             btn.textContent = '📷 QR 방 다시 만들기';
             document.getElementById('online-status-text').innerHTML =
-                `방 코드 <b class="text-amber-400 text-sm">${code}</b> 생성 완료! 친구가 QR코드를 스캔하거나 방 코드를 입력하면 자동으로 경기가 시작됩니다.`;
+                `방 코드 <b class="text-amber-400 text-sm">${code}</b> 생성 완료! 친구가 QR코드를 스캔하거나 방 코드를 입력하면 즉시 경기가 시작됩니다.`;
         }
 
         async function joinOnlineRoom(inputCode) {
@@ -2921,17 +3018,31 @@
                 return;
             }
 
+            const joinBtn = document.getElementById('join-room-btn');
+            joinBtn.disabled = true;
+            joinBtn.textContent = '입장 중...';
+
             const mode = await initNetworkBackend();
             currentRoomCode = code;
             myRole = 'guest';
             window.kboOnlineActive = true;
+            startNtfyRoomStream(code);
 
             const st = window.kboGameAPI.getState();
             const selectedP = KBO_TEAMS[st.selectedTeamIndex].pitchers[st.selectedPitcherIndex];
+            const joinPacket = {
+                type: 'JOIN_REQUEST',
+                roomCode: code,
+                guestTeamIdx: st.selectedTeamIndex,
+                guestLineup: JSON.stringify(st.userLineup),
+                guestPitcher: JSON.stringify(selectedP)
+            };
 
             if (mode === 'cloud') {
                 const snap = await getDoc(getRoomDocRef(code));
                 if (!snap.exists()) {
+                    joinBtn.disabled = false;
+                    joinBtn.textContent = '입장 (홈팀)';
                     document.getElementById('online-status-text').innerHTML =
                         `<span class="text-rose-400 font-bold">방 코드(${code})를 찾을 수 없습니다.</span> 코드를 다시 확인해 주세요.`;
                     return;
@@ -2945,18 +3056,87 @@
                     updatedAt: Date.now()
                 });
                 subscribeCloudRoom(code);
-            } else if (bc) {
-                bc.postMessage({
-                    type: 'JOIN_REQUEST',
-                    roomCode: code,
-                    guestTeamIdx: st.selectedTeamIndex,
-                    guestLineup: JSON.stringify(st.userLineup),
-                    guestPitcher: JSON.stringify(selectedP)
-                });
+            } else {
+                broadcastPacket(joinPacket);
+                // 방장이 응답할 때까지 1.2초 간격으로 최대 3회 자동 재전송
+                let retry = 0;
+                const retryTimer = setInterval(() => {
+                    if (window.kboGameAPI.getState().matchStarted || retry >= 3) {
+                        clearInterval(retryTimer);
+                        return;
+                    }
+                    retry++;
+                    broadcastPacket(joinPacket);
+                }, 1200);
             }
 
+            joinBtn.disabled = false;
+            joinBtn.textContent = '입장 (홈팀)';
             document.getElementById('online-status-text').innerHTML =
-                `<span class="text-emerald-400 font-bold">방(${code}) 연결 중...</span> 잠시 후 플레이볼됩니다!`;
+                `<span class="text-emerald-400 font-bold">방(${code})에 입장 신호를 보냈습니다!</span> 방장과 매칭되면 즉시 플레이볼됩니다.`;
+        }
+
+            renderQRCode(code);
+            btn.disabled = false;
+            btn.textContent = '📷 QR 방 다시 만들기';
+            document.getElementById('online-status-text').innerHTML =
+                `방 코드 <b class="text-amber-400 text-sm">${code}</b> 생성 완료! 친구가 QR코드를 스캔하거나 방 코드를 입력하면 즉시 경기가 시작됩니다.`;
+        }
+
+        async function joinOnlineRoom(inputCode) {
+            const code = (inputCode || '').trim().toUpperCase();
+            if (code.length < 4) {
+                document.getElementById('online-status-text').innerHTML =
+                    `<span class="text-amber-300 font-bold">6자리 방 코드를 입력해 주세요.</span>`;
+                return;
+            }
+
+            const joinBtn = document.getElementById('join-room-btn');
+            joinBtn.disabled = true;
+            joinBtn.textContent = '연결 중...';
+
+            const mode = await initNetworkBackend();
+            currentRoomCode = code;
+            myRole = 'guest';
+            window.kboOnlineActive = true;
+
+            const st = window.kboGameAPI.getState();
+            const selectedP = KBO_TEAMS[st.selectedTeamIndex].pitchers[st.selectedPitcherIndex];
+            const joinPacket = {
+                type: 'JOIN_REQUEST',
+                roomCode: code,
+                guestTeamIdx: st.selectedTeamIndex,
+                guestLineup: JSON.stringify(st.userLineup),
+                guestPitcher: JSON.stringify(selectedP)
+            };
+
+            if (mode === 'cloud') {
+                const snap = await getDoc(getRoomDocRef(code));
+                if (!snap.exists()) {
+                    joinBtn.disabled = false;
+                    joinBtn.textContent = '입장 (홈팀)';
+                    document.getElementById('online-status-text').innerHTML =
+                        `<span class="text-rose-400 font-bold">방 코드(${code})를 찾을 수 없습니다.</span> 코드를 다시 확인해 주세요.`;
+                    return;
+                }
+                await updateDoc(getRoomDocRef(code), {
+                    status: 'playing',
+                    guestUid: currentUser.uid,
+                    guestTeamIdx: st.selectedTeamIndex,
+                    guestLineup: JSON.stringify(st.userLineup),
+                    guestPitcher: JSON.stringify(selectedP),
+                    updatedAt: Date.now()
+                });
+                subscribeCloudRoom(code);
+            } else {
+                broadcastPacket(joinPacket);
+                await connectPeerGuest(code, joinPacket);
+            }
+
+            joinBtn.disabled = false;
+            joinBtn.textContent = '입장 (홈팀)';
+            document.getElementById('online-status-text').innerHTML =
+                `<span class="text-emerald-400 font-bold">방(${code}) 연결 완료 대기 중...</span> 방장과 동기화되면 바로 시작됩니다!`;
         }
 
         async function pushRoomEvent(type, payloadObj) {
@@ -2972,8 +3152,8 @@
                     eventPayload: JSON.stringify(payloadObj),
                     updatedAt: Date.now()
                 });
-            } else if (bc) {
-                bc.postMessage({
+            } else {
+                broadcastPacket({
                     type: 'GAME_EVENT',
                     roomCode: currentRoomCode,
                     sender: myRole,
